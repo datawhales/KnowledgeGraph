@@ -17,7 +17,9 @@ matplotlib.use('Agg')
 # from apex import amp
 from tqdm import tqdm
 from tqdm import trange
-from torch.utils import data
+from torch.utils.data import DataLoader
+from torch.utils.data import RandomSampler
+from torch.utils.data.distributed import DistributedSampler
 from collections import Counter
 from transformers import AdamW, get_linear_schedule_with_warmup
 # from dataset import *
@@ -40,6 +42,36 @@ def set_seed(args):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
+
+def train(args, model, train_dataset):
+    # total step
+    step_tot = (len(train_dataset) // args.gradient_accumulation_steps // args.batch_size_per_gpu // args.n_gpu) * args.max_epoch
+
+    train_sampler = DistributedSampler(train_dataset) if args.local_rank != -1 else RandomSampler(train_dataset)
+    params = {
+        "batch_size": args.batch_size_per_gpu,
+        "sampler": train_sampler
+    }
+    train_dataloader = DataLoader(train_dataset, **params)
+
+    # optimizer
+    no_decay = ['bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {
+            'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            'weight_decay': args.weight_decay
+        },
+        {
+            'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            'weight_decay': 0.0
+        }
+    ]
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr, eps=args.adam_epsilon, correct_bias=False)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=step_tot)
+
+    # amp training
+    model, optimizer=  amp.initialize(model, optimizer, opt_level="01")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="latentRE")
@@ -69,7 +101,44 @@ if __name__ == "__main__":
     parser.add_argument("--local_rank", dest="local_rank", type=int, default=-1, help="local rank")
     args = parser.parse_args()
 
+    # print args
     print('-------args-------')
     for i in list(vars(args).keys()):
-        print(f"{k}: {vars(args)[i]}")
+        print(f"{i}: {vars(args)[i]}")
     print('-------args-------\n')
+
+    # set backend
+    if args.local_rank == -1:
+        device = torch.device("cuda")
+    else:
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device("cuda", args.local_rank)
+        torch.distributed.init_process_group(backend="nccl")
+
+    args.device = device
+    args.n_gpu = len(args.cuda.split(","))
+    set_seed(args)
+
+    # log train
+    if args.local_rank in [0, -1]:  # gpu 1개인 경우
+        if not os.path.exists("../log"):
+            os.mkdir("../log")
+        with open("../log/pretrain_log", 'a+') as f:
+            f.write(str(time.ctime()) + "\n")  # 현재 시각 ex) Thu Apr 1 14:50:04 2021
+            f.write(str(args) + "\n")   # argument 저장
+            f.write("-------------------------------------------------\n")
+
+    # model and dataset
+    if args.model == "MTB":
+        model = MTB(args).to(args.device)    # model.py 의 MTB
+        train_dataset = MTBDataset("../data/MTB", args)    # dataset.py 의 MTBDataset
+    elif args.model == "CP":
+        model = CP(args).to(args.device)    # model.py 의 CP
+        train_dataset = CPDataset("../data/CP", args)  # dataset.py 의 CPDataset
+    else:
+        raise Exception("No such model! Please make sure that 'model' takes the value in {MTB, CP}")
+    
+    # barrier to make sure all process train the model simultaneously
+    if args.local_rank != -1:
+        torch.distributed.barrier()
+    train(args, model, train_dataset)
